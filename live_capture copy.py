@@ -460,37 +460,43 @@ class ZktecoWrapper:
             self.log_error(f"Unexpected error in send_attendance_request: {e}")
 
     def connect(self, enable_live_capture=False):
-        """Enhanced connection with better retry logic"""
+        """Enhanced connection with env-driven retry + non-blocking first connect."""
+        # fast-return if already good
         if self.zk and self.zk.is_connect and self.zk.helper.test_ping():
             if enable_live_capture:
                 self.start_live_capture_thread()
             return True
-        
-        retry_count = 0
-        max_retries = 1
-        base_delay = 2
 
-        while retry_count < max_retries and not self.stop_event.is_set():
+        retry_count = 0
+        # read from env (defaults to old values)
+        max_retries = int(os.getenv("DEVICE_CONNECT_RETRIES", "10"))
+        base_delay  = int(os.getenv("DEVICE_RETRY_DELAY",   "6"))
+
+        while retry_count < max_retries and not getattr(self, "stop_event", threading.Event()).is_set():
             try:
                 self.zk.connect()
                 self.log_info(f"Connected to {self.device_name} successfully")
                 retry_count = 0
-                
+
                 if enable_live_capture:
                     self.start_live_capture_thread()
-                    
                 return True
-                
+
             except Exception as e:
                 retry_count += 1
-                if retry_count <= max_retries:
-                    delay = min(base_delay * retry_count, 60)  # Max 60 second delay
-                    self.log_warning(f"Connection attempt {retry_count}/{max_retries} failed: {e}. Retrying in {delay}s...")
-                    self.stop_event.wait(delay)
+                # only wait if we’re going to retry
+                if retry_count < max_retries:
+                    delay = min(base_delay * retry_count, 60)
+                    self.log_warning(
+                        f"Connection attempt {retry_count}/{max_retries} to {self.device_name} failed: {e!r}. "
+                        f"Retrying in {delay}s…"
+                    )
+                    # block this wrapper’s thread, not the main app
+                    getattr(self, "stop_event", threading.Event()).wait(delay)
                 else:
-                    self.log_error(f"Failed to connect after {max_retries} attempts")
+                    self.log_error(f"Failed to connect after {max_retries} attempts to {self.device_name}")
                     break
-                    
+
         return False
 
     def enable_device(self):

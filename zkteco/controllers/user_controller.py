@@ -485,35 +485,54 @@ def delete_user_from_selected_devices(user_id):
 @bp.route('/device/<int:device_id>/user/<user_id>/fingerprint', methods=['POST'])
 def create_fingerprint_on_device(device_id, user_id):
     """Create fingerprint on specific device"""
-    data = request.json
+    data = request.json or {}
     temp_id = data.get('temp_id')
-    
+
     if temp_id is None:
         return jsonify({"error": "temp_id is required"}), 400
-    
+
     try:
         device_info = multi_device_service.get_device_info(device_id)
         if not device_info:
             return jsonify({"message": f"Device {device_id} not found"}), 404
 
-        # Check if user exists
         if not multi_device_service.execute_on_device(device_id, 'user_exists', int(user_id)):
             return jsonify({"message": "User not found on this device"}), 404
-            
+
         current_app.logger.info(f"Creating fingerprint for user {user_id} on device {device_id}")
+
+        # Try enrolling the user on that device
         multi_device_service.execute_on_device(device_id, 'enroll_user', int(user_id), int(temp_id))
-        
+
         return jsonify({
             "message": f"Fingerprint enrollment started on {device_info['name']}",
             "device_id": device_id,
             "device_name": device_info['name'],
             "user_id": int(user_id),
             "temp_id": int(temp_id)
-        })
+        }), 202
+
     except Exception as e:
-        error_message = f"Error creating fingerprint on device {device_id}: {str(e)}"
+        raw = str(e)
+
+        # Handle specific ZK SDK error
+        if raw.startswith("Cant Enroll user") and "[" in raw:
+            code = raw.rsplit("[", 1)[-1].rstrip("]")
+            code_map = {
+                "0": "Timeout – please retry",
+                "1": "Template already exists",
+                "2": "Template database is full",
+                # Extend as needed
+            }
+            friendly = code_map.get(code, f"Device returned error code {code}")
+            current_app.logger.error(f"Enrollment failed on device {device_id}: {friendly}")
+            return jsonify({"message": friendly}), 400
+
+        # Fallback generic error
+        error_message = f"Error creating fingerprint on device {device_id}: {raw}"
         current_app.logger.error(error_message)
         return jsonify({"message": error_message}), 500
+
 
 @bp.route('/device/<int:device_id>/user/<user_id>/fingerprint/<temp_id>', methods=['GET'])
 def get_fingerprint_from_device(device_id, user_id, temp_id):

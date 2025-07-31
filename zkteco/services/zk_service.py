@@ -10,6 +10,11 @@ import time
 from zkteco.logger import app_logger
 
 load_dotenv()
+class EnrollmentError(Exception):
+    """Raised when fingerprint enrollment fails with a ZK error code."""
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
 
 class ZkService:
     """
@@ -61,44 +66,56 @@ class ZkService:
         except Exception:
             return False
 
-    def connect(self, max_retries: int = 3) -> bool:
+    def connect(self, max_retries: int = None, base_delay: int = None) -> bool:
         """
         Connect to ZKTeco device with retry logic.
-        
+        Retries and initial delay can be overridden by environment variables:
+          - DEVICE_CONNECT_RETRIES
+          - DEVICE_RETRY_DELAY
+
         Args:
-            max_retries: Maximum number of connection attempts
-            
+            max_retries: Maximum number of connection attempts (overridden by env)
+            base_delay: Initial backoff delay in seconds (overridden by env)
         Returns:
             bool: True if connected successfully, False otherwise
         """
+        # Derive settings from env or defaults
+        max_retries = int(os.getenv("DEVICE_CONNECT_RETRIES", str(max_retries or 3)))
+        base_delay  = int(os.getenv("DEVICE_RETRY_DELAY",      str(base_delay  or 6)))
+
+        # Validate ZK instance
         if not self.zk:
             app_logger.error(f"ZK instance not initialized for {self.ip}:{self.port}")
             return False
-            
+
+        # Already connected?
         if self.is_connected():
             return True
 
-        retry_count = 0
-        
-        while retry_count < max_retries:
+        # Attempt to connect with exponential backoff
+        for attempt in range(1, max_retries + 1):
             try:
                 self.zk.connect()
                 app_logger.info(f"Connected to ZK device {self.ip}:{self.port} successfully")
                 return True
+
             except Exception as e:
-                retry_count += 1
                 app_logger.warning(
                     f"Failed to connect to ZK device {self.ip}:{self.port}. "
-                    f"Attempt {retry_count}/{max_retries}. Error: {e}"
+                    f"Attempt {attempt}/{max_retries}. Error: {e}"
                 )
-                if retry_count < max_retries:
-                    # Exponential backoff with max 30s delay
-                    delay = min(6 * retry_count, 30)
+                if attempt < max_retries:
+                    # exponential backoff: base_delay * 2^(attempt-1), capped at 30s
+                    delay = min(base_delay * (2 ** (attempt - 1)), 30)
+                    app_logger.info(f"Waiting {delay}s before retry #{attempt + 1}...")
                     time.sleep(delay)
                 else:
-                    app_logger.error(f"Failed to connect after {max_retries} attempts to {self.ip}:{self.port}")
+                    app_logger.error(
+                        f"Failed to connect after {max_retries} attempts "
+                        f"to {self.ip}:{self.port}"
+                    )
                     return False
-        
+
         return False
 
     def disconnect(self) -> bool:
@@ -295,61 +312,75 @@ class ZkService:
             self.enable_device()
 
     def enroll_user(self, user_id: int, temp_id: int) -> bool:
-        """
-        Start fingerprint enrollment for a user.
-        
-        Args:
-            user_id: User ID for enrollment
-            temp_id: Template ID (finger index 0-9)
-            
-        Returns:
-            bool: True if enrollment started successfully
-            
-        Raises:
-            Exception: If enrollment fails to start
-        """
         try:
-            self._ensure_connection_and_disable()
+            self.connect()
+            self.disable_device()
             self.zk.enroll_user(
                 uid=user_id,
                 temp_id=temp_id,
                 user_id=str(user_id)
             )
-            app_logger.info(f"User enrollment started: user_id={user_id}, temp_id={temp_id}, device={self.ip}:{self.port}")
+            app_logger.info(f"User enrollment started: user_id={user_id}, temp_id={temp_id}")
             return True
         except Exception as e:
-            app_logger.error(f"Error enrolling user {user_id} on {self.ip}:{self.port}: {e}")
+            app_logger.error(f"Error enrolling user {user_id}: {e}")
             raise
         finally:
             self.enable_device()
 
-    def cancel_enroll_user(self) -> bool:
+
+
+    def enroll_user(self, user_id: int, temp_id: int, timeout: int = None) -> bool:
         """
-        Cancel ongoing fingerprint enrollment.
-        
+        Start fingerprint enrollment for a user.
+
+        Args:
+            user_id (int): The user ID to enroll.
+            temp_id (int): The finger index (0–9).
+            timeout (int, optional): Override the default SDK timeout.
+
         Returns:
-            bool: True if cancellation successful
-            
+            bool: True if enrollment started successfully.
+
         Raises:
-            Exception: If cancellation fails
+            EnrollmentError: If SDK returns a known ZK error code.
+            Exception: For all other failures.
         """
         try:
-            if not self.connect():
-                raise Exception(f"Could not connect to device {self.ip}:{self.port}")
-                
-            # Stop live capture if running
-            if hasattr(self.zk, 'end_live_capture'):
-                self.zk.end_live_capture = True
-                
+            self.connect()
             self.disable_device()
-            self.zk.cancel_capture()
-            app_logger.info(f"User enrollment cancelled on device {self.ip}:{self.port}")
+
+            # Set timeout, with fallback to device config or default
+            if timeout is not None:
+                self.zk._timeout = timeout
+            elif hasattr(self, 'config') and getattr(self.config, 'timeout', None):
+                self.zk._timeout = self.config.timeout
+
+            self.zk.enroll_user(
+                uid=user_id,
+                temp_id=temp_id,
+                user_id=str(user_id)
+            )
+
+            app_logger.info(
+                f"User enrollment started: user_id={user_id}, temp_id={temp_id}, device={self.ip}:{self.port}"
+            )
             return True
+
         except Exception as e:
-            app_logger.error(f"Error cancelling enrollment on {self.ip}:{self.port}: {e}")
+            raw = str(e)
+            app_logger.error(f"Error enrolling user {user_id} on {self.ip}:{self.port}: {raw}")
+
+            if raw.startswith("Cant Enroll user") and "[" in raw:
+                code = raw.rsplit("[", 1)[-1].rstrip("]")
+                raise EnrollmentError(code, raw)
+
             raise
+
         finally:
             self.enable_device()
+
+
 
     def delete_user_template(self, user_id: int, temp_id: int) -> bool:
         """
